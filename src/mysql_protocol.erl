@@ -231,8 +231,13 @@ prepare(Query, SockModule, Socket) ->
           StmtId:32/little,
           NumColumns:16/little,
           NumParams:16/little,
-          0, %% reserved_1 -- [00] filler
-          WarningCount:16/little>> ->
+          _Reserved:8,
+          Rest/binary>> ->
+            WarningCount = case Rest of
+                <<Warn:16/little, _/binary>> -> Warn;
+                <<Warn:16/little>> -> Warn;
+                <<>> -> 0
+            end,
             %% This was the first packet.
             %% Now: Parameter Definition Block. The parameter definitions don't
             %% contain any useful data at all. They are always TYPE_VAR_STRING
@@ -875,8 +880,12 @@ fetch_column_definitions_if_any(0, _SockModule, _Socket, SeqNum) ->
 fetch_column_definitions_if_any(N, SockModule, Socket, SeqNum) ->
     {ok, Defs, SeqNum1} = fetch_column_definitions(SockModule, Socket, SeqNum,
                                                    N, []),
-    {ok, ?eof_pattern, SeqNum2} = recv_packet(SockModule, Socket, SeqNum1),
-    {Defs, SeqNum2}.
+    case recv_packet(SockModule, Socket, SeqNum1) of
+        {ok, ?eof_pattern, SeqNum2} ->
+            {Defs, SeqNum2};
+        {ok, ?ok_pattern, SeqNum2} ->
+            {Defs, SeqNum2}
+    end.
 
 %% @doc Decodes a packet representing a row in a binary result set.
 %% It consists of a 0 byte, then a null bitmap, then the values.
