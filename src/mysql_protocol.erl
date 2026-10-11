@@ -112,14 +112,10 @@ handshake_finish_or_switch_auth(Handshake, Password, SockModule, Socket, SeqNum)
                                        SockModule, Socket, ServerVersion, SeqNum),
     case AuthResult of
         #ok{status = OkStatus} ->
-            %% check status, ignoring bits
-            %% - 16#4000, SERVER_SESSION_STATE_CHANGED
-            %% - 16#0002, SERVER_STATUS_AUTOCOMMIT
-            %% - 16#0020, SERVER_STATUS_NO_INDEX_USED
-            BitMask = bnot (?SERVER_SESSION_STATE_CHANGED bor ?SERVER_STATUS_AUTOCOMMIT bor ?SERVER_STATUS_NO_INDEX_USED),
-            StatusMasked = Status band BitMask,
-            StatusMasked = OkStatus band BitMask,
-            {ok, Handshake, SockModule, Socket};
+            %% Some compatible engines (e.g. OceanBase, Doris, TiDB) may return
+            %% different status flags in OK packet compared to handshake packet.
+            %% Update the handshake record with the confirmed OkStatus.
+            {ok, Handshake#handshake{status = OkStatus}, SockModule, Socket};
         Error ->
             Error
     end.
@@ -410,10 +406,21 @@ get_server_info(ServerVersion) ->
 %% @doc Converts a version on the form `<<"5.6.21">' to a list `[5, 6, 21]'.
 -spec server_version_to_list(binary()) -> [integer()].
 server_version_to_list(ServerVersion) ->
-    %% This must work with e.g. "5.5.40-0ubuntu0.12.04.1-log" and "5.5.33a".
-    {match, Parts} = re:run(ServerVersion, <<"^(\\d+)\\.(\\d+)\\.(\\d+)">>,
-                            [{capture, all_but_first, binary}]),
-    lists:map(fun binary_to_integer/1, Parts).
+    %% This must work with e.g. "5.5.40-0ubuntu0.12.04.1-log" and "5.5.33a",
+    %% as well as Doris/StarRocks versions.
+    case re:run(ServerVersion, <<"^(\\d+)\\.(\\d+)\\.(\\d+)">>,
+                [{capture, all_but_first, binary}]) of
+        {match, Parts} ->
+            lists:map(fun binary_to_integer/1, Parts);
+        nomatch ->
+            case re:run(ServerVersion, <<"^(\\d+)\\.(\\d+)">>,
+                        [{capture, all_but_first, binary}]) of
+                {match, Parts2} ->
+                    lists:map(fun binary_to_integer/1, Parts2) ++ [0];
+                nomatch ->
+                    [5, 7, 0]
+            end
+    end.
 
 -spec maybe_do_ssl_upgrade(Host :: inet:socket_address() | inet:hostname(),
                            SockModule0 :: module(),
@@ -531,8 +538,11 @@ build_handshake_response(Handshake, Username, Password, Database,
                                  CapabilityFlags :: integer()) ->
     true | no_return().
 verify_server_capabilities(Handshake, CapabilityFlags) ->
-    %% We require these capabilities. Make sure the server handles them.
-    Handshake#handshake.capabilities band CapabilityFlags == CapabilityFlags
+    %% We require core capabilities (protocol 4.1 and secure connection).
+    %% Some compatible databases like Apache Doris do not advertise
+    %% optional flags like CLIENT_TRANSACTIONS or CLIENT_FOUND_ROWS.
+    RequiredCaps = CapabilityFlags band (bnot (?CLIENT_TRANSACTIONS bor ?CLIENT_FOUND_ROWS)),
+    Handshake#handshake.capabilities band RequiredCaps == RequiredCaps
         orelse error(old_server_version).
 
 -spec basic_capabilities(ConnectWithDB :: boolean(),
